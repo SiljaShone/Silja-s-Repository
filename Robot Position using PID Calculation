@@ -1,0 +1,806 @@
+
+/*******************************************************************************
+* File: RobotPosition.C
+* By  : Silja Shone
+* Date: 10 May 2019
+*
+* Description :
+*     Robot calculates its position with constant pwm.
+*     Written for IAR compiler, using Normal DLIB Library.
+* Limitations :
+*     This program assumes the robot starts at the origin
+*     and is pointing along the x axis.
+*******************************************************************************/
+
+/*******************************************************************************
+* INCLUDES
+*******************************************************************************/
+#include <iom128.h>
+#include <intrinsics.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+/*******************************************************************************
+* DEFINES
+*******************************************************************************/
+#define PI 3.141593
+
+#define RIGHT_SPEED 1023
+#define LEFT_SPEED  1023
+#define BUF_MAX     1000
+
+#define USE_SERIAL_INTERRUPTS 1
+#define REC_QUEUE_SIZE 64 
+#define STR_ARRAY_SIZE 100 
+#define TR_QUEUE_SIZE 512
+/*******************************************************************************
+*ENUMERATIONS
+*******************************************************************************/ 
+// commands 
+enum {STOP_CMD, GO_CMD, ANGLE_CMD};
+ // Navigation states 
+enum {STOPPED_STATE, MOVING_STATE, TURNING_STATE}; 
+// GO command states 
+enum {GO_START_STATE, GO_TURN_STATE, GO_PID_STATE, GO_STOP_STATE}; 
+
+/*******************************************************************************
+* STRUCTURES
+*******************************************************************************/
+struct Position 
+{
+   
+    float x; // x and y position coordinates in metres
+    float y;
+    float h;
+ 
+ };
+struct target
+{
+  
+    char cmd;//command enumeration value
+    float xT;
+    float yT;
+    float hT;
+    
+};
+/*******************************************************************************
+* FUNCTION PROTOTYPES
+*******************************************************************************/
+void Setup(void); // ATmega128 initialisation for this program
+// calculate robot position from wheel pulse counts
+void Position(struct Position *ppos);
+void OutputString(char* str); // put string in serial port 0 transmit buffer
+void PID_Calculation(struct Position *ppos,struct target *ptarg, int *startingFlag); // PID calculation
+void motor(char newCmd, struct Position *ppos, struct target *ptarg);
+void Turn_Right(void);
+void Turn_Left(void);
+char Command_Function(struct Position *ppos, struct target *ptarg);
+int GoToTarget(struct Position *ppos, struct target *ptarg, int startingFlag);
+int GoToAngle(struct Position *ppos, struct target *ptarg, int startingFlag);
+void Turn_Right_Slowly(void);
+void Turn_Left_Slowly(void);
+/*******************************************************************************
+* GLOBAL VARIABLES
+*******************************************************************************/
+volatile unsigned int leftPulseCount, rightPulseCount; // wheel pulse counts
+volatile unsigned int Timer3_Flag;
+#if USE_SERIAL_INTERRUPTS == 1
+// serial port 0 transmit buffer
+char buffer[BUF_MAX]; // buffer (queue) data
+volatile unsigned int head, tail, count; // buffer (queue) indexes 
+#endif
+
+#if USE_SERIAL_INTERRUPTS == 1
+volatile char Tqueue[TR_QUEUE_SIZE]; // array for transmit chars 
+volatile int Thead, Ttail, Tcount; //buffer indexes 
+#endif // array for temporary strings to transmit to PC 
+
+volatile char Rqueue[REC_QUEUE_SIZE]; // array for received chars 
+volatile int Rhead, Rtail, Rcount; // buffer indexes
+volatile char cmdCount; // received command counter
+
+
+/*******************************************************************************
+* MAIN FUNCTION
+*******************************************************************************/
+void main (void)
+{
+    struct Position pos; // current position from CalcPosition
+    struct target targ;
+    char newCmd;
+    pos.x = 0.;
+    pos.y = 0.;
+    pos.h = 0.;
+    Setup(); // initialise ATmega128
+    
+    __enable_interrupt(); // enable interrupts 
+    while (1) // loop forever
+    {  
+        Position(&pos); // calculate position from wheel counters
+        newCmd = Command_Function(&pos, &targ);
+        motor(newCmd,&pos,&targ);
+    }
+}
+
+/*******************************************************************************
+* OTHER FUNCTIONS
+*******************************************************************************/
+
+void motor(char newCmd, struct Position *ppos, struct target *ptarg)
+{
+  static int state = STOPPED_STATE; // Navigation state static
+  static int entry = 1; // system has entered a new state
+  char done; // true if at target // change the Navigation state if a new command is being started 
+
+    if (newCmd)
+    {
+
+      switch (ptarg->cmd)
+       {
+          case STOP_CMD:
+           
+            state = STOPPED_STATE; 
+            entry = 1; // indicates entry from a transition 
+            break; 
+         
+          case GO_CMD:
+          
+            state = MOVING_STATE;
+            entry = 1;
+            break;
+        
+          case ANGLE_CMD:
+          
+            state = TURNING_STATE;
+            entry = 1;
+            break;
+          
+         }
+    } 
+  // implement the states of the NAVIGATION state machine 
+  switch (state) 
+  { 
+      case MOVING_STATE: 
+      
+      if (entry) 
+        { 
+          
+          OutputString("NAV MOVING\r\n"); // message to PC
+       
+        } 
+      done = 0;
+      done = GoToTarget(ppos, ptarg, entry); 
+          entry = 0;
+      if (done) 
+        {
+          
+          state = STOPPED_STATE;
+          entry = 1; 
+          
+        } 
+      break; 
+    
+      case TURNING_STATE:
+      
+        if (entry) 
+          { 
+            
+            OutputString("NAV TURNING\r\n");
+            entry = 0;
+            
+          }
+        done = GoToAngle(ppos, ptarg, entry);
+        
+        if (done) 
+          {
+            
+            state = STOPPED_STATE;
+            entry = 1; 
+            
+          } 
+        break;
+    
+    case STOPPED_STATE:
+      
+    if (entry) 
+      { 
+        
+         OCR1A = 0;//turn OFF both motors
+         OCR1B = 0;
+         OutputString("NAV STOPPED\r\n"); 
+         entry = 0;
+         
+      }
+      break;
+    
+    }
+ } 
+
+         /********************/
+
+
+void Setup(void) // ATmega128 setup
+{
+   // char str[40]; // serial output string
+      // serial output: enable receive and transmit
+    // 8 data bits, no parity, 1 stop
+    // interrupts disabled
+    UCSR0A = 0;
+    UCSR0B = 0x98; // enable receive and transmit
+    UCSR0C = 0x06; // 8 data bits, no parity, 1 stop
+    // set the baud rate
+    UBRR0H = 0; // 9600 bps = 51, 19200 bps = 25, 38400 bps = 12
+    UBRR0L = 12; 
+    
+    // timer3 setup for interrupt every 100ms: CTC: mode 4 prescale=64
+    TCCR3A = 0X00;
+    TCCR3B = 0X0B;
+    // interrupt every 100ms(10HZ interrupt) 12499
+    OCR3AH = 0x30;
+    OCR3AL = 0xD3;
+    //enable TIMER 3 INTERRUPT
+    ETIMSK |= (1 << 4); // OCIE3A was throwing error
+        
+    // timer1 setup for pwm: enable pwm outputs, mode 7 prescale=256
+    TCCR1A = 0XA3;
+    TCCR1B = 0X0C;
+    // motors off using pwm
+    OCR1A = 0;
+    OCR1B = 0;
+    // enable motor outputs
+    DDRB |= (1 << 5);
+    DDRB |= (1 << 6);
+    // enable motor direction outputs
+    DDRA |= (1 << 6);
+    DDRA |= (1 << 7);
+    // motors forward
+    PORTA &= ~(1 << 6);
+    PORTA &= ~(1 << 7);
+    // enable the wheel pulse generator electronics
+    DDRC = 0X08; //0B00001000
+    PORTC = 0x08;
+    // give the electronic hardware time to settle
+    __delay_cycles(4000000); // 500ms
+    // enable external interrupts for the wheel pulses (INT0, INT1)
+    EIMSK = 0X03;
+    EICRA = 0X0F;
+    // give the electronic hardware time to settle
+    __delay_cycles(4000000); // 500ms
+    // enable external interrupts for the wheel pulses (INT0, INT1)
+    #if USE_SERIAL_INTERRUPTS == 1
+    // initialise serial output buffer
+    head = 0;
+    tail = 0;
+    count = 0;
+    #endif
+    __enable_interrupt(); // enable interrupts last
+    // display program name on serial port
+    OutputString("\r\nROBOT POSITION\r\n");
+
+}
+
+char Command_Function(struct Position *ppos, struct target *ptarg)
+{
+  char ch; // received character 
+  char numCmd; // number of commands 
+  char newCmd = 0; // new command boolean 
+  char cmd[STR_ARRAY_SIZE]; // received command string
+  char str[STR_ARRAY_SIZE];
+  int i; // command array index 
+  int n; // sscanf return value 
+  float f1, f2; // command parameter values
+  // CHECK FOR A NEW COMMAND 
+  // IF THERE IS A NEW COMMAND 
+  // copy command from the receive queue to the local array 
+ 
+  __disable_interrupt();
+  numCmd = cmdCount;
+ 
+    
+    if(numCmd > 0)
+    {
+        cmdCount--;
+        ch = 0;
+        i=0;
+        
+      while (ch != '\r' && Rcount > 0)
+          {
+            
+              ch = Rqueue[Rhead];
+              Rhead = (Rhead + 1) & (REC_QUEUE_SIZE - 1);
+              Rcount--;
+              __enable_interrupt();
+              // enable interrupts while copying ch to cmd array
+              if (ch == '\r')
+                  {
+                    cmd[i] = 0;
+                  }
+              else
+                  {
+                    
+                    cmd[i] = ch;
+                  }
+              i++;
+              __disable_interrupt();
+          }
+    __enable_interrupt();
+
+
+    if (strncmp(cmd, "GO", 2) == 0)
+        {   
+            
+          n = sscanf(cmd + 3, "%f,%f", &f1, &f2);
+            
+          if (n == 2)
+            
+          {
+            
+            ptarg->cmd = GO_CMD;
+            ptarg->xT = f1;
+            ptarg->yT = f2;
+            sprintf(str, "CMD GO %.3f,%.3f\r\n", f1, f2);
+            OutputString(str);
+            newCmd = 1; // set the new command flag 
+          }
+      
+        else
+          {
+              
+            OutputString("CMD ERROR\r\n");
+          }
+        }
+  if (strncmp(cmd, "TURN", 4) == 0)
+    {   
+      
+        n = sscanf(cmd + 5, "%f", &f1);
+        if (n == 1)
+          {       
+              
+            ptarg->cmd = ANGLE_CMD;
+            sprintf(str, "CMD ANGLE %.3f\r\n", f1);
+            OutputString(str);
+            f1 = (f1 * PI)/180;// converting to radians
+            ptarg->hT = f1;
+            newCmd = 1; // set the new command flag 
+          }
+      
+        else
+          {     
+            
+            OutputString("CMD ERROR\r\n");
+          }
+    }
+    
+   if (strncmp(cmd, "STOP", 4) == 0)
+    {   
+     
+      n = sscanf(cmd + 1, "%f", &f1);
+      if (n == 0)
+        {
+          
+          ptarg->cmd = STOP_CMD;
+          sprintf(str, "CMD STOP %.3f\r\n", f1);
+          OutputString(str);
+          newCmd = 1; // set the new command flag 
+        }
+      
+      else
+        {
+          
+          OutputString("CMD ERROR\r\n");
+        }
+    }
+ 
+ }
+ // CHECK FOR OTHER COMMANDS 
+// DISPLAY ERROR IF THE COMMAND IS INVALID
+// return newCmd at the end of the Command function 
+return newCmd; 
+
+}
+
+int GoToTarget(struct Position *ppos, struct target *ptarg, int startingFlag)
+{
+  static int state = GO_START_STATE;
+  static int entry = 1;
+  int done = 0; // CALCULATE distance and error 
+  float distance;
+  float hT;
+  float e;
+  int startingPID;
+  distance = sqrt (((ppos->x - ptarg->xT)*(ppos->x - ptarg->xT)) + ((ppos->y - ptarg->yT)*(ppos->y - ptarg->yT)));
+  //static int startingFlag = 0; // used as int since "bool" is throwing error  
+             hT = atan2( (ptarg->yT) - (ppos->y) , (ptarg->xT) - (ppos->x));
+            e = ppos->h - hT;
+  
+    if (startingFlag)
+      { 
+        
+        state = GO_START_STATE; 
+        entry = 1;
+      } 
+    // MOVING state machine 
+      switch (state)
+        {
+          case GO_START_STATE:
+          if (entry) 
+            {
+              
+              OutputString("GO STATE = START\r\n"); 
+              entry = 0;
+            } // more code for this state // ADD OTHER CASES 
+           if (distance <= 0.050) // metres
+           {
+             
+            state = GO_STOP_STATE;
+            entry = 1;
+            } 
+          else
+          {
+            
+            state = GO_TURN_STATE;
+            entry = 1;
+            } 
+          break;
+
+          case GO_TURN_STATE:
+          if (entry) 
+          {
+              OutputString("GO STATE = TURN\r\n"); 
+              entry = 0;
+           }
+  
+          if ( e > 0.5 )
+          {
+            
+            Turn_Right();
+          }
+          
+          else if ( e <-0.5 )
+          {
+           
+            Turn_Left();
+          }
+  
+          else
+            {
+              entry = 1;
+              state = GO_PID_STATE;
+            }
+            break;
+          
+          case GO_PID_STATE:
+           if (entry) 
+            {
+              
+              OutputString("GO STATE = PID\r\n");
+              entry = 0;
+              startingPID = 1;
+            }
+              if (distance <= 0.050) // metres
+              {
+                
+                state = STOP_CMD;
+              }
+              else if (e > 0.5 || e < -0.5) // radians
+              {
+                
+                entry = 1;
+                state = GO_TURN_STATE;
+              }
+              else
+              {
+                
+                 PID_Calculation( ppos, ptarg, &startingPID);
+              }
+           break;
+            
+          case GO_STOP_STATE: 
+          if (entry)
+            { 
+              
+              OutputString("GO STATE = STOP\r\n");
+              entry = 0;
+            } 
+          OCR1A = 0; 
+          OCR1B = 0; 
+          done = 1; // this state machine has finished break;
+          break;
+        } 
+  
+ 
+  return done;
+}
+
+
+int GoToAngle(struct Position *ppos, struct target *ptarg, int startingFlag)
+{
+  float e;
+  int done;           
+            e = ppos->h - ptarg->hT;
+             if (e > PI)
+              {
+                  e = e - 2 * PI ;
+              }
+             else if (e < -PI)
+              {
+                  e = e + 2* PI;
+              }
+            if ( e > 1 )
+              {
+              
+                Turn_Right();
+            
+              }
+            else if ( e < -1 )
+              {
+            
+                Turn_Left();
+          
+              }
+  
+            if ( (e < 1) && (e > 0.3))
+              {
+            
+                Turn_Right_Slowly();
+            
+                }
+            else if ( (e > -1) && (e < -0.3) )
+              {
+            
+                  Turn_Left_Slowly();
+            
+              }
+          
+            if((e<0.3)&&(e>-0.3))
+            {
+
+                done = 1;
+          }
+
+   return done;       
+}
+
+void Position(struct Position *ppos) // calculate the robot position
+{
+    int leftCount, rightCount; // number of wheel pulses
+    static char str[100]; // serial output string
+    float dx, dy, dh, r;
+    // get the pulse counts
+    __disable_interrupt();
+    leftCount = leftPulseCount; // copy the pulse counts
+    rightCount = rightPulseCount;
+    leftPulseCount = 0; // reset the pulse counts to zero
+    rightPulseCount = 0;
+    __enable_interrupt();
+    // if there were any pulses, calculate the new position
+   
+    if (leftCount || rightCount)
+      {
+           
+        // do the position calculation
+        dh = ( rightCount - leftCount) * 0.06686; 
+        if  (leftCount == rightCount)
+       
+              {
+                  dx = 0.007114* rightCount * cos (ppos -> h);
+                  dy = 0.007114* rightCount * sin (ppos -> h);
+           
+                }
+     
+        else
+       
+       
+            {
+                  r = 0.0532 * (rightCount + leftCount) / ( rightCount - leftCount);
+                  dx = r * (sin (ppos -> h + dh) - sin (ppos -> h));
+                  dy = r * (cos (ppos -> h) - cos (ppos -> h + dh));
+        
+              }
+     
+     
+          ppos ->h = ppos -> h+dh;
+          if (ppos->h < -PI)
+                {
+                  ppos->h = ppos->h+2 * PI;
+                  }
+           else if (ppos -> h > PI)
+              {
+                ppos->h = ppos->h -2*PI;
+              }
+              ppos->x= ppos->x + dx;
+              ppos->y= ppos->y +dy;
+              
+      
+        // display the new position (convert heading to degrees)
+        sprintf(str, "POS,%7.3f,%7.3f,%7.1f,%3d,%3d\r\n", ppos->x, ppos->y,
+         ppos->h * 180. / PI, leftCount, rightCount);
+        OutputString(str);
+      }
+}
+
+  
+ void PID_Calculation(struct Position *ppos,struct target *ptarg, int *startingFlag)
+ {
+    static float ep = 0; // previous value of error e
+    float e; // current value of error e
+    float  PL, PR, F, hT;
+    char str[60];
+    static float integral; // accumulated integral value
+    float differential; // differential value
+        
+  if (Timer3_Flag == 1)
+  { 
+        Timer3_Flag = 0;
+        hT = atan2(ptarg->yT-ppos->y , ptarg->xT-ppos->x);
+        e = ppos->h- hT; // error signal
+        
+        if (e > PI)
+       {
+         e = e - 2 * PI ;
+       }
+       else if (e < -PI)
+       {
+         e = e + 2* PI;
+       }
+ 
+     if (*startingFlag == 1)
+     {
+       integral = 0;
+       differential = 0; 
+       *startingFlag = 0;
+     }  
+     else
+     {
+       integral += e + ep;
+       differential =  e - ep; 
+       
+     }
+       F = (2000 * e) + (100 * integral) + (750 * differential);//output of PID
+       
+       if (F >= 0)
+       {
+         PL = 1023;
+         if( F > 1023)
+         {
+           PR = 0;
+         }
+         else
+         {
+           PR = 1023 - F;
+         }
+       
+       }
+       else if(F<0)
+       {
+         PR = 1023;
+         if (F < (-1023))
+         {
+           PL = 0;
+         }
+         else
+         {
+           PL = 1023 + F;
+         }
+       }
+       OCR1A = (int) PL;//Assigning new pwm values
+       OCR1B = (int)PR;//
+       ep = e;
+       
+        //display the new position (convert heading to degrees)
+        sprintf(str, "PID,%5.2f,%5.2f,%5.2f,%5.0f,%4.0f,%4.0f\r\n",e , integral,
+         differential, F, PL, PR);
+        OutputString(str);
+     }
+ }
+  
+   void Turn_Right(void)  
+{
+ 
+    OCR1A = 1023; 
+    OCR1B = 0;    
+}
+
+void Turn_Right_Slowly(void)
+{
+    OCR1A = 200; 
+    OCR1B = 0;   
+}
+
+void Turn_Left(void)
+{
+    OCR1A = 0;
+    OCR1B = 1023;
+}
+       
+ void Turn_Left_Slowly(void)
+ {
+    OCR1A = 0; 
+    OCR1B = 200;   
+    
+ }
+ 
+char str[STR_ARRAY_SIZE]; // INTERRUPT SERVICE ROUTINES (ISR) 
+// transmit serial string USING INTERRUPTS
+void OutputString(char* str)
+{
+  int length = strlen(str);
+  UCSR0B_UDRIE0 = 0; // disable serial port 0 UDRE interrupt 
+  // check for enough buffer space
+  if (Tcount + length <= TR_QUEUE_SIZE)
+  {
+    // write the characters into the buffer 
+    for (int n = 0; n < length; n++)
+    { 
+      UCSR0B_UDRIE0 = 0; // disable serial port 0 UDRE 
+      Tqueue[Ttail] = str[n]; 
+      Ttail = (Ttail + 1) & (TR_QUEUE_SIZE - 1); 
+      Tcount++;
+      UCSR0B_UDRIE0 = 1; // enable serial port 0 UDRE interrupt 
+    }
+  }
+  UCSR0B_UDRIE0 = 1; // enable serial port 0 UDRE interrupt 
+}
+
+
+
+/*******************************************************************************
+* INTERRUPT FUNCTIONS
+*******************************************************************************/
+#pragma vector = INT0_vect
+__interrupt void LeftCounterISR(void) // left wheel pulse counter
+{
+    leftPulseCount++;
+}
+
+
+#pragma vector = INT1_vect
+__interrupt void RightCounterISR(void) // right wheel pulse counter
+{
+    rightPulseCount++;
+}
+
+#pragma vector = TIMER3_COMPA_vect
+__interrupt void SetTimer3Interrupt(void) // Set timer 3 flag every 100ms
+{
+    Timer3_Flag = 1;
+}
+
+/*************/
+
+#if USE_SERIAL_INTERRUPTS == 1
+#pragma vector = USART0_UDRE_vect //
+__interrupt void SerialTransmitISR(void) // serial transmit interrupt
+ {
+ if (Tcount > 0) // if there are more characters 
+{ 
+UDR0 = Tqueue[Thead]; // transmit the next character
+ // increment and wrap the head index 
+Thead = (Thead + 1) & (TR_QUEUE_SIZE - 1); 
+Tcount--;
+ } 
+if (Tcount == 0) // if there are no more characters
+ { 
+UCSR0B_UDRIE0 = 0; // then disable serial port 0 UDRE interrupt
+ }
+ }
+ // serial receive isr 
+#pragma vector = USART0_RXC_vect //
+__interrupt void SerialReceiveISR(void)
+ {
+ char ch; 
+ch = UDR0; // check the queue is not full 
+if (Rcount < REC_QUEUE_SIZE) 
+{
+ Rqueue[Rtail] = ch; // store the new character
+ // increment and wrap the tail index
+ Rtail = (Rtail + 1) & (REC_QUEUE_SIZE - 1);
+ Rcount++; 
+if (ch == '\r') // end of the command 
+{
+ cmdCount++; 
+}
+}
+ }
+#endif
